@@ -488,7 +488,7 @@ class SmolVLMWithExpertModel(nn.Module):
         num_layers = self.num_vlm_layers
         head_dim = self.vlm.config.text_config.head_dim
         expert_block_summaries = [] 
-        extracted_vlm_hidden = None
+        extracted_vlm_hidden = None  # 初始化萃取變數
 
         for layer_idx in range(num_layers):
             if (
@@ -620,15 +620,17 @@ class SmolVLMWithExpertModel(nn.Module):
         att_weights = torch.matmul(query_states, key_states.transpose(2, 3))
         att_weights *= head_dim**-0.5
 
-        # --- 注入 AVA Log-additive Attention Bias ---
+        # 【核心修改】注入 AVA Log-additive Attention Bias，並確保型別對齊
         if attn_bias is not None:
-            # attn_bias 廣播形狀: [B, 1, Q_len, K_len] 或 [B, H, Q_len, K_len]
             att_weights = att_weights + attn_bias.to(dtype=att_weights.dtype)
 
+        # 數值穩定性：僅在 Softmax 階段提升至 Float32
         att_weights = att_weights.to(dtype=torch.float32)
         big_neg = torch.finfo(att_weights.dtype).min
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        
+        # 算完機率後立即轉回模型原始精度 (BFloat16)
         probs = probs.to(dtype=value_states.dtype)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))

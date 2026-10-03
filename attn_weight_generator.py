@@ -204,11 +204,19 @@ class InjectActionModule(nn.Module):
         tokens = self.pre_norm(tokens)
         action_tokens = self.pre_action_norm(action_tokens)
 
-        # 支援動態長度對齊
+        # 【核心修改】支援動態長度對齊與防禦截斷
         q_len = tokens.shape[1]
         k_len = action_tokens.shape[1]
-        q_pos = self.query_position_ids[:q_len] if q_len <= len(self.query_position_ids) else torch.arange(q_len, device=tokens.device)
-        k_pos = self.key_position_ids[:k_len] if k_len <= len(self.key_position_ids) else torch.arange(q_len, q_len + k_len, device=tokens.device)
+        
+        if q_len <= len(self.query_position_ids):
+            q_pos = self.query_position_ids[:q_len]
+        else:
+            q_pos = torch.arange(q_len, device=tokens.device)
+            
+        if k_len <= len(self.key_position_ids):
+            k_pos = self.key_position_ids[:k_len]
+        else:
+            k_pos = torch.arange(q_len, q_len + k_len, device=tokens.device)
 
         attn_out, _ = self.cross_attn(
             tokens, action_tokens, action_tokens, q_pos, k_pos
@@ -401,8 +409,11 @@ class SoftmaxScoreHead(nn.Module):
         tokens = self.pre_norm(tokens.reshape(B * N, D)).reshape(B, N, D)
         logits = self.proj(tokens)  # (B, N, 2)
 
-        if self.alpha is not None and batch_idx is not None:  # Training
-            tau = float(max(self.final_tau, self.init_tau * np.exp(-self.alpha * batch_idx)))
+        if self.training:
+            if self.alpha is not None and batch_idx is not None:
+                tau = float(max(self.final_tau, self.init_tau * np.exp(-self.alpha * batch_idx)))
+            else:
+                tau = self.init_tau
             probs = F.softmax(logits / tau, dim=-1)
             attn_weights = self.score_bias + probs[:, :, [0]] * self.scores[0] + probs[:, :, [1]] * self.scores[1]
             ret_value = (attn_weights, probs[:, :, [0]])
@@ -504,6 +515,7 @@ class AttentionWeightGenerator(nn.Module):
 
         image_h, image_w, image_dim = image_shape
         self.image2embed = build_mlp(image_dim, embed_dim, hidden_size=embed_dim // 2)
+        
         image_pos_embed = get_2d_position_embedding(image_h, image_w, embed_dim)
         self.register_buffer(
             "image_pos_embed",
@@ -511,6 +523,7 @@ class AttentionWeightGenerator(nn.Module):
             persistent=False,
         )
 
+        # 【核心修改】嚴格使用傳入的 text_dim (如 960 或 2048)
         self.text2embed = build_mlp(text_dim, embed_dim, hidden_size=embed_dim // 2, out_act=True)
 
         action_frames, action_dim, action_feature_dim = action_shape

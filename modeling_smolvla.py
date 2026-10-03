@@ -354,14 +354,26 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
     ) -> dict[str, Tensor]:
-        """
-        支援 POMDP 軌跡時序展開 (T=4) 與截斷時間反向傳播 (TBPTT)
-        """
+        """支援 POMDP 軌跡時序展開與源頭一次性精度對齊"""
+        
+        # 【核心修改】從模型參數動態取得當前真實 dtype (例如加入了 LoRA 的 BFloat16)
+        model_dtype = next(self.model.parameters()).dtype
+        
+        # 源頭轉換：保證所有要進 DataLoader 的連續數值直接對齊 BFloat16，不再反覆轉換
+        if OBS_STATE in batch:
+            batch[OBS_STATE] = batch[OBS_STATE].to(dtype=model_dtype)
+        if ACTION in batch:
+            batch[ACTION] = batch[ACTION].to(dtype=model_dtype)
+        if noise is not None:
+            noise = noise.to(dtype=model_dtype)
+        if time is not None:
+            time = time.to(dtype=model_dtype)
+
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
-        T = self.config.ava_tbptt_steps if self.config.use_ava else 1
+        T = self.config.ava_tbptt_steps if getattr(self.config, "use_ava", False) else 1
         total_flow_loss = 0.0
         total_reg_loss = 0.0
         r_prev = None
@@ -494,32 +506,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """
         對齊 AVA 原論文第二階段設定:
         1. 針對 LLM backbone、Vision encoder、Action head、Proprioceptive projector 套用 rank=32 LoRA
-        2. AVA 專屬模組 (recurrent_projector_B, ava_generator, vlm_act_to_expert_proj)
-           維持全參數最佳化 (放入 modules_to_save)
+        2. AVA 專屬模組維持全參數最佳化 (放入 modules_to_save)
         """
-        # 1. 匹配 VLM (視覺與語言層) + Action Expert 的注意力與前饋投影矩陣
-        # 2. 匹配 state_proj (本體感覺投影層)
-        # 3. 匹配 action_in_proj / action_out_proj / action_time_mlp (動作頭投影)
+        # 精確鎖定子線性層，避免匹配到外層的 nn.Sequential 容器
         target_modules = (
-            r".*(q_proj|k_proj|v_proj|out_proj|fc1|fc2|proj)$"
-            r"|.*state_proj.*"
-            r"|.*action_in_proj.*"
-            r"|.*action_out_proj.*"
-            r"|.*action_time_mlp_in.*"
-            r"|.*action_time_mlp_out.*"
+            r".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|out_proj|fc1|fc2)$"
+            r"|.*state_proj(\.[0-9]+)?$"
+            r"|.*action_in_proj(\.[0-9]+)?$"
+            r"|.*action_out_proj(\.[0-9]+)?$"
+            r"|.*action_time_mlp_in(\.[0-9]+)?$"
+            r"|.*action_time_mlp_out(\.[0-9]+)?$"
         )
 
-        # 論文規定: while fully optimizing the proposed AVA mechanism
-        # 這些模組不套用 LoRA，而是進行完整的全參數更新並儲存在 checkpoint 中
-        modules_to_save = [
-            "model.recurrent_projector_B",
-            "model.ava_generator",
-            "model.vlm_act_to_expert_proj",
-        ]
+        modules_to_save = []
+        if getattr(self.config, "use_ava", False):
+            modules_to_save = [
+                "model.recurrent_projector_B",
+                "model.ava_generator",
+                "model.vlm_act_to_expert_proj",
+            ]
 
         return {
             "target_modules": target_modules,
-            "modules_to_save": modules_to_save,
+            "modules_to_save": modules_to_save if modules_to_save else None,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -590,8 +599,7 @@ class VLAFlowMatching(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.rtc_processor = rtc_processor  # ✅ 保存在實例變數即可
-        vlm_dim = 2048 # SmolVLM2 text hidden_size
+        self.rtc_processor = rtc_processor  
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -618,21 +626,32 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
-        # ==================== AVA 模組初始化 ====================
-        if self.config.use_ava:
-            # 2 層 MLP 投影器 B: 2048 -> 2048 (帶 SiLU)
+        # ==================== AVA 模組動態初始化 ====================
+        if getattr(self.config, "use_ava", False):
+            # 1. 動態取得語言主幹真實維度 (SmolVLM-2 500M 預設為 960)
+            vlm_dim = self.vlm_with_expert.config.text_config.hidden_size
+
+            # 2. 動態探測視覺特徵維度 (Dummy Forward 探測)
+            vision_dim = 960  # fallback
+            try:
+                device = next(self.vlm_with_expert.parameters()).device
+                dtype = next(self.vlm_with_expert.parameters()).dtype
+                dummy_img = torch.zeros(1, 3, *self.config.resize_imgs_with_padding, device=device, dtype=dtype)
+                vision_dim = self.vlm_with_expert.embed_image(dummy_img).shape[-1]
+            except Exception:
+                if hasattr(self.vlm_with_expert.config, "vision_config"):
+                    vision_dim = getattr(self.vlm_with_expert.config.vision_config, "hidden_size", 960)
+
+            # 3. 確保 B 矩陣嚴格使用動態取得的 vlm_dim
             self.recurrent_projector_B = build_mlp(
                 vlm_dim, vlm_dim, hidden_size=vlm_dim, depth=2, out_act=False
             )
-            # 線性映射層: 將 VLM 動作特徵 (2048) 映射到 Action Expert 維度
             self.vlm_act_to_expert_proj = nn.Linear(vlm_dim, self.vlm_with_expert.expert_hidden_size)
 
-            # AVA 模組 (attn_weight_generator)
-            # 視覺形狀假定為 (8, 8, 2048) 對應 64 個 Token
             self.ava_generator = AttentionWeightGenerator(
-                embed_dim=self.config.ava_hidden_dim, # d' = 512
-                image_shape=(8, 8, vlm_dim),
-                action_shape=(self.config.ava_chunk_len, self.config.ava_action_dim, vlm_dim), # (10, 7, 2048)
+                embed_dim=self.config.ava_hidden_dim, 
+                image_shape=(8, 8, vision_dim),  # 精確填入探測出的視覺維度
+                action_shape=(self.config.ava_chunk_len, self.config.ava_action_dim, vlm_dim), 
                 text_dim=vlm_dim,
                 num_images=len(self.config.image_features),
                 score_config=self.config.ava_score_config,
@@ -885,11 +904,11 @@ class VLAFlowMatching(nn.Module):
         self, images, img_masks, lang_tokens, lang_masks, state, actions,
         noise=None, time=None, recurrent_state=None
     ):
-        """單步 forward：計算 Flow Matching Loss、抽取 h^t_act 生成 r_t，以及 AVA 權重"""
+        # 由於 SmolVLAPolicy 已經源頭轉換過 actions, noise, time，此處無需再呼叫 .to(dtype=)
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            noise = self.sample_noise(actions.shape, actions.device).to(dtype=actions.dtype)
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(actions.shape[0], actions.device).to(dtype=actions.dtype)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -945,9 +964,8 @@ class VLAFlowMatching(nn.Module):
             ).transpose(1, 2)
             suffix_out = suffix_out + act_expert_guidance
 
-        suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        flow_losses = F.mse_loss(u_t, v_t, reduction="none")
+        flow_losses = F.mse_loss(u_t.to(torch.float32), v_t.to(torch.float32), reduction="none")
 
         return flow_losses, omega_t, next_recurrent_state
 

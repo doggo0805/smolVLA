@@ -106,36 +106,36 @@ class SmolVLAConfig(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
-    compile_model: bool = False  # Whether to use torch.compile for model optimization
-    compile_mode: str = "max-autotune"  # Torch compile mode
+    
+    compile_model: bool = False
+    compile_mode: str = "max-autotune"
 
-    # ==================== AVA (Active Visual Attention) Configurations ====================
-    use_ava: bool = True
-    ava_chunk_len: int = 10                  # L_c = 10
-    ava_action_dim: int = 7                  # D = 7
-    ava_action_tokens_len: int = 70          # L_A = L_c * D = 70
-    ava_hidden_dim: int = 512                # d' = 512
-    ava_layer_idx: int = 15                  # Layer 16 (0-indexed 15)
-    ava_score_config: tuple[float, float, float] = (1.9, 0.1, 0.0) # gamma = [1.9, 0.1]
-    ava_lambda_reg: float = 1.0              # lambda = 1.0
-    ava_reg_target_c: float = 0.6            # c = 0.6 (CALVIN 時設為 0.2)
-    ava_tbptt_steps: int = 4                 # T = 4 (Trajectory unroll horizon)
-    ava_detach_step: int = 2                 # Detach recurrent state at t == 2
+    # ==================== PEFT (LoRA) Configurations ====================
     use_peft: bool = False
     r: int = 32
     lora_alpha: int = 64
+    lora_dropout: float = 0.0
 
-    action_dim: int = 7
-    num_action_tokens: int = 70
-    ava_state_dim: int = 32
-    tbptt_steps: int = 4
-    unroll_steps: int = 4
-    ava_num_heads: int = 4
-    ava_head_type: str = "softmaxscore"
-    ava_lambda_omega: float = 1.0
-    ava_c_target: float = 0.6
-    ava_selected_ratio: float | None = None
-    ava_extra_layer_ids: list[int] | None = None
+    # ==================== AVA (Active Visual Attention) Configurations ====================
+    use_ava: bool = False
+    
+    # 動作與佔位符規格 (可直接沿用 SmolVLA 原生欄位，或保留專用名稱)
+    ava_chunk_len: int = 10                  # Action Chunk 長度 L_c
+    ava_action_dim: int = 7                  # 動作維度 D
+    ava_action_tokens_len: int = 70          # L_A = L_c * D = 70
+    
+    # AVA 核心架構超參數
+    ava_hidden_dim: int = 512                # AVA 模組內部維度 d'
+    ava_layer_idx: int = 15                  # 抽取隱狀態的層數 (Layer 16，0-indexed)
+    ava_score_config: tuple[float, float, float] = (1.9, 0.1, 0.0) # gamma 縮放與偏置
+    
+    # 正則化損失超參數
+    ava_lambda_reg: float = 1.0              # lambda 損失權重
+    ava_reg_target_c: float = 0.6            # 正則化均值目標 c (LIBERO 為 0.6, CALVIN 為 0.2)
+    
+    # 時序展開與截斷 (TBPTT)
+    ava_tbptt_steps: int = 4                 # POMDP 展開步數 T
+    ava_detach_step: int = 2                 # 截斷梯度的時間步
     
 
     def __post_init__(self):
