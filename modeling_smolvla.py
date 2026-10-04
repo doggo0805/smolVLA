@@ -245,6 +245,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
+        self.model.to(dtype=torch.bfloat16)
 
     def reset(self):
         """環境 reset 時將跨步循環狀態初始化為 None"""
@@ -361,15 +362,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
-        T = self.config.ava_tbptt_steps if self.config.use_ava else 1
+        # 時序步數由配置決定 (預設 4 步)，不再受限於 use_ava
+        T = getattr(self.config, "ava_tbptt_steps", 4)
+        detach_step = getattr(self.config, "ava_detach_step", 2)
         total_flow_loss = 0.0
         total_reg_loss = 0.0
         r_prev = None
 
-        # 若 batch 包含時序展開維度，在此迴圈迭代；若無則單步展開
         for t in range(T):
-            # TBPTT: 在第 2 步與第 3 步之間 (t == 2) 截斷歷史計算圖
-            if t == self.config.ava_detach_step and r_prev is not None:
+            # TBPTT 截斷歷史計算圖 (始終執行)
+            if t == detach_step and r_prev is not None:
                 r_prev = r_prev.detach()
 
             images, img_masks = self.prepare_images(batch)
@@ -394,19 +396,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
             step_flow_loss = flow_losses.mean()
             total_flow_loss = total_flow_loss + step_flow_loss
 
-            # 計算 AVA 正則化損失: L_omega = ||mean(omega_t) - c||_2
-            if self.config.use_ava and omega_t is not None:
+            # AVA 正則化損失 (僅在啟用 AVA 且有 omega_t 時計算)
+            if getattr(self.config, "use_ava", False) and omega_t is not None:
                 c = self.config.ava_reg_target_c
                 l_omega = torch.norm(omega_t.mean() - c, p=2)
                 total_reg_loss = total_reg_loss + l_omega
 
-        # 總損失 L_total = L_flow + lambda * L_omega
-        total_loss = (total_flow_loss / T) + self.config.ava_lambda_reg * (total_reg_loss / T)
+        # 總損失: 沒開 AVA 時只計算 Flow Loss
+        lambda_reg = self.config.ava_lambda_reg if getattr(self.config, "use_ava", False) else 0.0
+        total_loss = (total_flow_loss / T) + lambda_reg * (total_reg_loss / T)
 
         loss_dict = {
             "loss": total_loss.item(),
             "flow_loss": (total_flow_loss / T).item(),
-            "reg_loss": (total_reg_loss / T).item() if self.config.use_ava else 0.0,
+            "reg_loss": (total_reg_loss / T).item() if getattr(self.config, "use_ava", False) else 0.0,
         }
         return total_loss, loss_dict
 
@@ -618,26 +621,41 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
-        # ==================== AVA 模組初始化 ====================
-        if self.config.use_ava:
-            # 2 層 MLP 投影器 B: 2048 -> 2048 (帶 SiLU)
-            self.recurrent_projector_B = build_mlp(
-                vlm_dim, vlm_dim, hidden_size=vlm_dim, depth=2, out_act=False
-            )
-            # 線性映射層: 將 VLM 動作特徵 (2048) 映射到 Action Expert 維度
+        # ==================== 1. 遞迴狀態投影器 B (始終初始化，維持時序基底) ====================
+        vlm_dim = self.vlm_with_expert.config.text_config.hidden_size # 960
+        self.recurrent_projector_B = build_mlp(
+            vlm_dim, vlm_dim, hidden_size=vlm_dim, depth=2, out_act=False
+        )
+
+        # ==================== 2. AVA 專屬模組 (僅在啟用 AVA 時初始化) ====================
+        self.ava_generator = None
+        self.vlm_act_to_expert_proj = None
+
+        if getattr(self.config, "use_ava", False):
+            # (A) 映射動作生成輸入: 將 VLM 動作隱狀態投影至 Action Expert 維度
             self.vlm_act_to_expert_proj = nn.Linear(vlm_dim, self.vlm_with_expert.expert_hidden_size)
 
-            # AVA 模組 (attn_weight_generator)
-            # 視覺形狀假定為 (8, 8, 2048) 對應 64 個 Token
+            # (B) 動態探測視覺特徵維度 (SigLIP 預設為 960)
+            vision_dim = 960
+            try:
+                device = next(self.vlm_with_expert.parameters()).device
+                dtype = next(self.vlm_with_expert.parameters()).dtype
+                dummy_img = torch.zeros(1, 3, *self.config.resize_imgs_with_padding, device=device, dtype=dtype)
+                vision_dim = self.vlm_with_expert.embed_image(dummy_img).shape[-1]
+            except Exception:
+                if hasattr(self.vlm_with_expert.config, "vision_config"):
+                    vision_dim = getattr(self.vlm_with_expert.config.vision_config, "hidden_size", 960)
+
+            # (C) VLM 軟權重生成器 (計算 omega_t)
             self.ava_generator = AttentionWeightGenerator(
-                embed_dim=self.config.ava_hidden_dim, # d' = 512
-                image_shape=(8, 8, vlm_dim),
-                action_shape=(self.config.ava_chunk_len, self.config.ava_action_dim, vlm_dim), # (10, 7, 2048)
+                embed_dim=self.config.ava_hidden_dim, 
+                image_shape=(8, 8, vision_dim),
+                action_shape=(self.config.ava_chunk_len, self.config.ava_action_dim, vlm_dim), 
                 text_dim=vlm_dim,
                 num_images=len(self.config.image_features),
                 score_config=self.config.ava_score_config,
             )
-        # ========================================================
+        # ==================================================================================
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -735,21 +753,20 @@ class VLAFlowMatching(nn.Module):
         pad_masks.append(torch.ones(bsize, states_seq_len, dtype=torch.bool, device=state.device))
         att_masks += [1] * states_seq_len
 
-        # ==================== 拼接 70 個動作佔位符 Tokens ====================
-        if self.config.use_ava:
-            la = self.config.ava_action_tokens_len
-            d = self.vlm_with_expert.config.text_config.hidden_size
-            if recurrent_state is None:
-                # t = 0 步: p_0 = 0
-                placeholders = torch.zeros((bsize, la, d), dtype=state_emb.dtype, device=state.device)
-            else:
-                # t > 0 步: p_t = r_{t-1}
-                placeholders = recurrent_state.to(dtype=state_emb.dtype, device=state.device)
+        # ==================== 拼接 70 個動作佔位符 Tokens (始終常駐) ====================
+        la = getattr(self.config, "ava_action_tokens_len", 70)
+        d = self.vlm_with_expert.config.text_config.hidden_size
+        if recurrent_state is None:
+            # t = 0 步: p_0 = 0
+            placeholders = torch.zeros((bsize, la, d), dtype=state_emb.dtype, device=state.device)
+        else:
+            # t > 0 步: p_t = r_{t-1}
+            placeholders = recurrent_state.to(dtype=state_emb.dtype, device=state.device)
 
-            embs.append(placeholders)
-            pad_masks.append(torch.ones(bsize, la, dtype=torch.bool, device=state.device))
-            att_masks += [1] * la
-        # ===================================================================
+        embs.append(placeholders)
+        pad_masks.append(torch.ones(bsize, la, dtype=torch.bool, device=state.device))
+        att_masks += [1] * la
+        # =============================================================================
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -790,8 +807,9 @@ class VLAFlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state=state, recurrent_state=recurrent_state
         )
 
+        # 1. AVA 軟權重注意力偏置 (僅在啟用 AVA 時計算)
         attn_bias = None
-        if self.config.use_ava:
+        if getattr(self.config, "use_ava", False) and self.ava_generator is not None:
             _, (omega_t, _) = self.ava_generator(
                 image_tokens=slices["visual_embs"],
                 action_tokens=recurrent_state,
@@ -814,12 +832,11 @@ class VLAFlowMatching(nn.Module):
             extract_layer_idx=self.config.ava_layer_idx,
         )
 
-        # 擷取並更新下一個循環狀態 r_t
-        next_recurrent_state = None
-        if self.config.use_ava:
-            la = self.config.ava_action_tokens_len
-            h_t_act = extracted_vlm_hidden[:, -la:, :]
-            next_recurrent_state = self.recurrent_projector_B(h_t_act)
+        # 2. 擷取並更新下一個循環狀態 r_t (始終常駐)
+        la = getattr(self.config, "ava_action_tokens_len", 70)
+        h_t_act = extracted_vlm_hidden[:, -la:, :]
+        proj_b_dtype = next(self.recurrent_projector_B.parameters()).dtype
+        next_recurrent_state = self.recurrent_projector_B(h_t_act.to(dtype=proj_b_dtype))
 
         # Flow matching 解碼迴圈
         num_steps = self.config.num_steps
@@ -899,10 +916,10 @@ class VLAFlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state=state, recurrent_state=recurrent_state
         )
 
+        # ---------------- 1. AVA 專屬: VLM 軟權重注意力偏置計算 ----------------
         omega_t = None
         attn_bias = None
-        if self.config.use_ava:
-            # AVA 模組前向計算 soft weight omega_t
+        if getattr(self.config, "use_ava", False) and self.ava_generator is not None:
             _, (omega_t, _) = self.ava_generator(
                 image_tokens=slices["visual_embs"],
                 action_tokens=recurrent_state,
@@ -929,17 +946,18 @@ class VLAFlowMatching(nn.Module):
             extract_layer_idx=self.config.ava_layer_idx,
         )
 
-        # ---------------- 提取與 Action Expert 起始雜訊引導 ----------------
+        # ---------------- 2. 時序基底: 提取動作隱狀態並更新遞迴狀態 r_t (始終常駐) ----------------
+        la = getattr(self.config, "ava_action_tokens_len", 70)
+        h_t_act = extracted_vlm_hidden[:, -la:, :] # [B, 70, vlm_dim]
+        proj_b_dtype = next(self.recurrent_projector_B.parameters()).dtype
+        next_recurrent_state = self.recurrent_projector_B(h_t_act.to(dtype=proj_b_dtype)) # r_t = B(h^t_act)
+
+        # ---------------- 3. AVA 專屬: 映射動作生成輸入 (Action Expert 雜訊引導) ----------------
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :]
-        next_recurrent_state = None
 
-        if self.config.use_ava:
-            la = self.config.ava_action_tokens_len
-            h_t_act = extracted_vlm_hidden[:, -la:, :] # [B, 70, 2048]
-            next_recurrent_state = self.recurrent_projector_B(h_t_act) # r_t = B(h^t_act)
-
-            # 將 h^t_act 投影到 Action Expert 維度並疊加到動作預測特徵
-            act_expert_guidance = self.vlm_act_to_expert_proj(h_t_act)
+        if getattr(self.config, "use_ava", False) and self.vlm_act_to_expert_proj is not None:
+            proj_expert_dtype = next(self.vlm_act_to_expert_proj.parameters()).dtype
+            act_expert_guidance = self.vlm_act_to_expert_proj(h_t_act.to(dtype=proj_expert_dtype))
             act_expert_guidance = F.adaptive_avg_pool1d(
                 act_expert_guidance.transpose(1, 2), self.config.chunk_size
             ).transpose(1, 2)
